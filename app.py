@@ -35,12 +35,92 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from datetime import datetime, timedelta
+import hashlib
 
 st.set_page_config(
     page_title="Importadora BI Pro",
     page_icon="📦",
     layout="wide"
 )
+
+# =====================================================
+# CONTROL DE ACCESO - USUARIOS Y VENCIMIENTO
+# =====================================================
+
+# Usuarios demo. Cambia estos usuarios según tus clientes.
+# La contraseña NO se guarda en texto plano: se guarda como hash SHA-256.
+USUARIOS = {
+    "admin": {
+        "nombre": "Administrador",
+        "empresa": "Importadora BI Pro",
+        "password_hash": "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9",  # admin123
+        "expira": "2030-12-31",
+    },
+    "cliente_demo": {
+        "nombre": "Cliente Demo",
+        "empresa": "Empresa Demo SAC",
+        "password_hash": "d3ad9315b7be5dd53b31a273b3b3aba5defe700808305aa16a3062b76658a791",  # demo123
+        "expira": "2026-12-31",
+    },
+}
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def login():
+    st.title("🔐 Acceso privado")
+    st.markdown("Ingrese sus credenciales para acceder al dashboard.")
+
+    with st.form("login_form"):
+        usuario = st.text_input("Usuario")
+        password = st.text_input("Contraseña", type="password")
+        ingresar = st.form_submit_button("Ingresar")
+
+    if ingresar:
+        user_data = USUARIOS.get(usuario)
+
+        if user_data is None:
+            st.error("Usuario o contraseña incorrectos.")
+            st.stop()
+
+        if hash_password(password) != user_data["password_hash"]:
+            st.error("Usuario o contraseña incorrectos.")
+            st.stop()
+
+        fecha_expiracion = datetime.strptime(user_data["expira"], "%Y-%m-%d").date()
+        hoy = datetime.now().date()
+
+        if hoy > fecha_expiracion:
+            st.error("Tu acceso ha expirado. Comunícate con el administrador.")
+            st.stop()
+
+        st.session_state["autenticado"] = True
+        st.session_state["usuario"] = usuario
+        st.session_state["nombre"] = user_data["nombre"]
+        st.session_state["empresa"] = user_data["empresa"]
+        st.session_state["expira"] = user_data["expira"]
+        st.rerun()
+
+
+def cerrar_sesion():
+    for key in ["autenticado", "usuario", "nombre", "empresa", "expira"]:
+        if key in st.session_state:
+            del st.session_state[key]
+    st.rerun()
+
+
+if "autenticado" not in st.session_state:
+    login()
+    st.stop()
+
+with st.sidebar:
+    st.success(f"Acceso: {st.session_state['empresa']}")
+    st.caption(f"Usuario: {st.session_state['nombre']}")
+    st.caption(f"Válido hasta: {st.session_state['expira']}")
+    if st.button("Cerrar sesión"):
+        cerrar_sesion()
 
 # =====================================================
 # DATOS DEMO
@@ -164,10 +244,6 @@ def calcular_resumen_producto(df, dias_prediccion=30):
     ultimos_90 = df[df["fecha"] >= max_fecha - pd.Timedelta(days=90)]
     ultimos_180 = df[df["fecha"] >= max_fecha - pd.Timedelta(days=180)]
 
-    # Resumen histórico por producto.
-    # IMPORTANTE:
-    # Antes se usaba stock_actual=("stock_actual", "max"), pero eso es incorrecto
-    # porque el stock real debe ser el de la ÚLTIMA FECHA disponible para cada SKU.
     resumen = df.groupby(["sku", "producto", "categoria", "proveedor"], as_index=False).agg(
         unidades_total=("unidades_vendidas", "sum"),
         ventas_total=("venta_soles", "sum"),
@@ -176,7 +252,6 @@ def calcular_resumen_producto(df, dias_prediccion=30):
         costo_promedio=("costo_unitario", "mean"),
     )
 
-    # Tomar el último registro cronológico de cada producto para obtener stock vigente.
     ultimo_stock = (
         df.sort_values(["sku", "fecha"])
         .groupby("sku", as_index=False)
@@ -195,8 +270,6 @@ def calcular_resumen_producto(df, dias_prediccion=30):
     resumen = resumen.merge(demanda_180, on="sku", how="left")
     resumen[["demanda_30d", "demanda_90d", "demanda_180d"]] = resumen[["demanda_30d", "demanda_90d", "demanda_180d"]].fillna(0)
 
-    # Forecast simple pero potente para MVP:
-    # pondera últimos 30, 90 y 180 días para captar tendencia sin complicar demasiado.
     resumen["demanda_diaria_30"] = resumen["demanda_30d"] / 30
     resumen["demanda_diaria_90"] = resumen["demanda_90d"] / 90
     resumen["demanda_diaria_180"] = resumen["demanda_180d"] / 180
@@ -215,8 +288,6 @@ def calcular_resumen_producto(df, dias_prediccion=30):
         999
     )
 
-    # Días estimados antes de quedarse sin stock.
-    # Es más fácil de explicar comercialmente que "días_cobertura".
     resumen["dias_para_quiebre"] = np.where(
         resumen["demanda_diaria_predicha"] > 0,
         resumen["stock_actual"] / resumen["demanda_diaria_predicha"],
@@ -243,12 +314,6 @@ def calcular_resumen_producto(df, dias_prediccion=30):
 
     resumen["inversion_sugerida_compra"] = resumen["cantidad_sugerida_compra"] * resumen["costo_promedio"]
 
-    # Semáforo de decisión para compras.
-    # Se interpreta así:
-    # 🔴 Urgente: riesgo inmediato de quiebre o stock bajo el mínimo.
-    # 🟠 Comprar ahora: stock por debajo del punto de reorden.
-    # 🟡 Vigilar: stock cerca del punto de reorden.
-    # 🟢 OK: no requiere compra inmediata.
     condiciones_estado_compra = [
         (resumen["stock_actual"] <= resumen["stock_minimo"]) | (resumen["dias_para_quiebre"] <= 7),
         resumen["stock_actual"] < resumen["punto_reorden"],
